@@ -1,0 +1,9 @@
+[project]
+name = "MXFP8-quantizer"
+version = "0.1.0"
+description = "Blackwell MXFP8 quantizer kernel."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "modal>=1.4.2",
+]
