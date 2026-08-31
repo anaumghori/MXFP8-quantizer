@@ -5,5 +5,20 @@ description = "Blackwell MXFP8 quantizer kernel."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "modal>=1.4.2",
+    "nvidia-cutlass-dsl[cu13]==4.7.0",
+    "cuda-python>=13.0",
+    "numpy",
+    "packaging",
+    "torch==2.7.1",
 ]
+
+# uv: the PyTorch CUDA (cu128) builds are not published to PyPI, so route the
+# torch dependency to the PyTorch index. With `explicit = true` the index is
+# only consulted for packages that opt in via [tool.uv.sources] below.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }

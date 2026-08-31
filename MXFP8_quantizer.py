@@ -1,58 +1,64 @@
-from __future__ import annotations
+"""MXFP8 quantizer implementation for Blackwell (SM100): the CuTeDSL kernel,
+torch-reference verification, boundary robustness, and the end-to-end
+verification against the vendored SM100 blockscaled GEMM consumer.
+
+Public API:
+
+- :func:`run_quantizer`  - quantize + verify + benchmark one (m, k) problem
+- :func:`run_e2e_verification` - quantize A/B and verify the vendored GEMM output
+  (one (m, n, k, dtype, seed, mma_tiler, cluster) configuration)
+- :func:`run_e2e_suite` - run the e2e verification across a suite of shapes,
+  tilers, clusters, dtypes, and seeds; all must pass
+- :func:`prepare_and_quantize` - lower-level: quantize one matrix, no benchmark
+"""
+
 import dataclasses
-import json
 import statistics
 from typing import Any
-import modal
 
+# Default tiling used by the quantizer kernel: one CTA per (rows_per_cta, k_tile) tile, one warp per CTA
+DEFAULT_ROWS_PER_CTA = 8
+DEFAULT_K_TILE = 256
 
-APP_NAME = "mxfp8-quantizer-blackwell"
-CUTLASS_DSL_WHEEL = "nvidia-cutlass-dsl[cu13]==4.4.2"
-TORCH_WHEEL = "torch==2.7.1"
-TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
-CUDA_PYTHON_WHEEL = "cuda-python>=13.0"
-ROWS_PER_CTA = 8
-K_TILE = 256
-
-
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .env(
-        {
-            "PYTHONUNBUFFERED": "1",
-            # Keep file-backed CuTe artifacts alive inside the Modal container.
-            "CUTE_DSL_CACHE_DIR": "/tmp/cute_dsl_cache",
-        }
-    )
-    .uv_pip_install(
-        CUTLASS_DSL_WHEEL,
-        CUDA_PYTHON_WHEEL,
-        "numpy",
-        "packaging",
-    )
-    .uv_pip_install(
-        TORCH_WHEEL,
-        extra_index_url=TORCH_CUDA_INDEX,
-    )
+DEFAULT_E2E_SUITE: tuple[
+    tuple[int, int, int, str, int, tuple[int, int], tuple[int, int]], ...
+] = (
+    # Baseline config (same as the original single-run default).
+    (1024, 1024, 2048, "bf16", 0, (128, 128), (1, 1)),
+    # Larger M/N with an M-direction cluster multicast.
+    (2048, 2048, 2048, "bf16", 1, (128, 128), (2, 1)),
+    # Deeper K and fp16 input with an N-direction cluster multicast.
+    (1024, 2048, 4096, "fp16", 2, (128, 128), (1, 2)),
+    # 2-CTA MMA (M tiler 256) with an M cluster.
+    (2048, 2048, 4096, "bf16", 0, (256, 128), (2, 1)),
+    # 2-CTA MMA with a 2x2 cluster.
+    (2048, 1024, 2048, "fp16", 1, (256, 128), (2, 2)),
+    # Narrow N tiler (64) to exercise the N=64 epilogue path.
+    (1024, 1024, 2048, "bf16", 3, (128, 64), (1, 1)),
 )
 
-app = modal.App(APP_NAME, image=image)
 
-
-def _build_runtime():
+def build_runtime() -> dict[str, Any]:
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
-    import cutlass.cute.testing as testing
     import cutlass.utils as utils
     import torch
     from cutlass import BFloat16, Float16, Float32, Int32, Uint8, Uint16, Uint32, Uint64
+    try:
+        from cutlass import testing
+    except ImportError:
+        from cutlass.cute import testing
     from cutlass._mlir.dialects import llvm
     from cutlass.cute.nvgpu import cpasync
     from cutlass.cute.runtime import make_ptr
     from cutlass.cutlass_dsl import T, dsl_user_op
 
     FP8_E4M3_MAX = 448.0
+    # Maximum allowed |Q_byte - ref_byte| (in byte/ULP units) for the fp8 payload check.
+    # The kernel and the torch reference may round fp32->fp8 with different modes,
+    # which differs by at most 1 ULP; 2 leaves slack for saturation-boundary ties.
+    Q_BYTE_DIFF_TOLERANCE = 2
     SCALE_VEC_SIZE = 32
     SCALE_PACK_COLS = 4
     SCALE_ROWS_PER_PACK = 128
@@ -77,6 +83,7 @@ def _build_runtime():
             )
         )
 
+    @dsl_user_op
     def bitcast_u32_to_f32(x: Uint32, *, loc=None, ip=None) -> Float32:
         return Float32(
             llvm.inline_asm(
@@ -253,7 +260,6 @@ def _build_runtime():
             return self.k_tile // SCALE_VEC_SIZE
 
     class BlackwellMXFP8Quantizer:
-
         def __init__(self, config: MXFP8QuantizerConfig | None = None):
             self.cfg = config if config is not None else MXFP8QuantizerConfig()
 
@@ -261,8 +267,8 @@ def _build_runtime():
         def __call__(
             self,
             x_ptr: cute.Pointer,
-            q_dwords_ptr: cute.Pointer, # points to the packed FP8 output buffer
-            s_words_ptr: cute.Pointer, # points to the packed scale buffer
+            q_dwords_ptr: cute.Pointer,  # points to the packed FP8 output buffer
+            s_words_ptr: cute.Pointer,  # points to the packed scale buffer
             m: Int32,
             k: Int32,
             s_word_count: Int32,
@@ -308,7 +314,7 @@ def _build_runtime():
 
             # product_each normalizes the logical tile extent that the TMA copy should move per CTA
             cta_tile_shape = cute.product_each(shared_tile_layout.shape)
-            
+
             # Build the TMA load description for copying one CTA tile from global memory into shared memory
             input_tma_atom, input_tma_tensor = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileG2SOp(),
@@ -359,7 +365,6 @@ def _build_runtime():
             cfg = self.cfg
             thread_idx, _, _ = cute.arch.thread_idx()
             cta_row_tile_idx, cta_k_tile_idx, _ = cute.arch.block_idx()
-
             shared_memory_allocator = utils.SmemAllocator()
             shared_storage = shared_memory_allocator.allocate(self.shared_storage)
 
@@ -375,7 +380,6 @@ def _build_runtime():
             lane_id = thread_idx % 32
             row_within_cta = warp_id * cfg.rows_per_warp + lane_id // cfg.lanes_per_scale_block
             lane_within_quad = lane_id % cfg.lanes_per_scale_block
-
             global_row_idx = cta_row_tile_idx * cfg.rows_per_cta + row_within_cta
             tile_k_start = cta_k_tile_idx * cfg.k_tile
 
@@ -521,7 +525,7 @@ def _build_runtime():
                     packed_scale_output_tensor[packed_scale_byte_offset // 4] = packed_scale_word
 
     def ceil_div(a: int, b: int) -> int:
-        return (a + b - 1) // b   # Integer division rounded up so partial blocks still count as one full block
+        return (a + b - 1) // b  # Integer division rounded up so partial blocks still count as one full block
 
     # computes how many bytes are needed to store all scales in the packed format for an m x k matrix
     def packed_scale_storage_bytes(m: int, k: int, scale_vec_size: int) -> int:
@@ -536,6 +540,16 @@ def _build_runtime():
 
     def packed_scale_word_count(m: int, k: int, scale_vec_size: int) -> int:
         return packed_scale_storage_bytes(m, k, scale_vec_size) // 4  # Four scale bytes are packed into one Uint32 word
+
+    def _check_buffer_alignment(name: str, tensor, required_bytes: int) -> None:
+        # TMA loads and wide packed stores require specific address alignment; a
+        # misaligned torch view/slice would silently corrupt results, so fail loudly.
+        if tensor.data_ptr() % required_bytes != 0:
+            raise ValueError(
+                f"{name} buffer must be {required_bytes}-byte aligned for "
+                f"TMA/packed access, got data_ptr={tensor.data_ptr()} "
+                f"(misaligned by {tensor.data_ptr() % required_bytes} bytes)"
+            )
 
     def materialize_quantizer_buffers(
         m: int,
@@ -556,6 +570,12 @@ def _build_runtime():
             device="cuda",
         )
         packed_scale_bytes = packed_scale_words.view(torch.uint8)
+
+        # Boundary robustness: validate the alignment assumptions the kernel and
+        # TMA rely on before they are baked into the compiled kernel's pointers.
+        _check_buffer_alignment("x", x, 16)  # TMA global loads
+        _check_buffer_alignment("q", quantized_fp8, 8)  # packed Uint64 stores
+        _check_buffer_alignment("s", packed_scale_words, 4)  # packed Uint32 stores
 
         x_ptr = make_ptr(
             cutlass_input_dtype,
@@ -585,6 +605,95 @@ def _build_runtime():
             "x_ptr": x_ptr,
             "q_dwords_ptr": q_dwords_ptr,
             "s_words_ptr": s_words_ptr,
+        }
+
+    def reference_quantize(x_padded):
+        # Reproduce the kernel's quantization math in torch on the zero-padded
+        # input, so blocks that straddle the requested M/K boundary see exactly
+        # the same values the kernel reads.
+        m, k = x_padded.shape
+        x_f32 = x_padded.to(torch.float32)
+        blocks = x_f32.view(m, k // SCALE_VEC_SIZE, SCALE_VEC_SIZE)
+        amax = blocks.abs().amax(dim=2)  # (m, k // SCALE_VEC_SIZE)
+        device = x_padded.device
+        inv_448 = torch.tensor(1.0 / FP8_E4M3_MAX, dtype=torch.float32, device=device)
+        eps = torch.tensor(1.0e-12, dtype=torch.float32, device=device)
+        scaled = (
+            amax.to(torch.float64) * inv_448.to(torch.float64)
+            + eps.to(torch.float64)
+        ).to(torch.float32)
+        bits = scaled.view(torch.int32)
+        exponent = (bits >> 23) & 0xFF
+        mantissa = bits & 0x7FFFFF
+        scale_bytes = exponent + (mantissa != 0).to(torch.int32)
+        # The kernel special-cases all-zero blocks to byte 127 (scale = 1.0).
+        scale_bytes = torch.where(
+            amax == 0,
+            torch.full_like(scale_bytes, 127),
+            scale_bytes,
+        )
+
+        # The reciprocal scale is an exact power of two, so the fp32 product
+        # x * (1/scale) is exact; the only rounding is the final fp8 conversion.
+        inv_scale = torch.exp2((127 - scale_bytes).to(torch.float32))
+        inv_scale_expanded = inv_scale.repeat_interleave(SCALE_VEC_SIZE, dim=1)
+        q_fp8 = (x_f32 * inv_scale_expanded).to(torch.float8_e4m3fn)
+        return scale_bytes, q_fp8
+
+    def decode_scale_bytes(s_bytes, m, k):
+        # Invert the kernel's tcgen05 scale-word write layout back into a dense
+        # (m, k // SCALE_VEC_SIZE) matrix of UE8M0 bytes. The layout is the
+        # inverse of the kernel's byte-offset formula, so a correct kernel must
+        # reproduce the reference scales bit-exactly after this decode.
+        scale_cols = ceil_div(k, SCALE_VEC_SIZE)
+        packed_col_blocks = ceil_div(scale_cols, SCALE_PACK_COLS)
+        rows = torch.arange(m, device=s_bytes.device)[:, None]
+        cols = torch.arange(scale_cols, device=s_bytes.device)[None, :]
+        byte_offsets = (
+            (
+                (rows // SCALE_ROWS_PER_PACK) * packed_col_blocks
+                + cols // SCALE_PACK_COLS
+            )
+            * (SCALE_ROWS_PER_PACK * SCALE_PACK_COLS)
+            + ((rows % SCALE_ROWS_PER_PACK) % 32) * 16
+            + ((rows % SCALE_ROWS_PER_PACK) // 32) * 4
+            + cols % SCALE_PACK_COLS
+        )
+        return s_bytes[byte_offsets]
+
+    def verify_quantizer_outputs(buffers, kernel_m, kernel_k, real_m, real_k):
+        # Compare the kernel's q/s outputs against the independent torch
+        # reference. Scale bytes must match bit-exactly; the fp8 payload may
+        # differ by at most Q_BYTE_DIFF_TOLERANCE byte values (ULPs) to absorb
+        # fp32->fp8 rounding-mode differences in the reference conversion.
+        #
+        # Boundary robustness: only the real (non-padded) region is compared.
+        # Padded rows/columns carry no semantic meaning and are never consumed;
+        # the padding is semantics-preserving for the real region by construction
+        # (zero-padding cannot change an absmax).
+
+        scale_bytes_ref, q_fp8_ref = reference_quantize(buffers["x"])
+        q_bytes = buffers["q_bytes"].view(torch.uint8).to(torch.int32)
+        q_ref_bytes = q_fp8_ref.view(torch.uint8).to(torch.int32)
+        q_diff = (q_bytes - q_ref_bytes).abs()[:real_m, :real_k]
+        q_max_byte_diff = int(q_diff.max().item())
+        q_exact_fraction = float((q_diff == 0).float().mean().item())
+
+        dense_scales = decode_scale_bytes(buffers["s_storage_bytes"], kernel_m, kernel_k)
+        real_scale_cols = ceil_div(real_k, SCALE_VEC_SIZE)
+        scale_bytes_exact = bool(
+            (
+                dense_scales[:real_m, :real_scale_cols]
+                == scale_bytes_ref[:real_m, :real_scale_cols]
+            ).all().item()
+        )
+
+        verification_passed = scale_bytes_exact and q_max_byte_diff <= Q_BYTE_DIFF_TOLERANCE
+        return {
+            "verification_passed": verification_passed,
+            "q_max_byte_diff": q_max_byte_diff,
+            "q_exact_fraction": q_exact_fraction,
+            "scale_bytes_exact": scale_bytes_exact,
         }
 
     def make_compiled_quantizer(
@@ -651,6 +760,106 @@ def _build_runtime():
             "std_runtime_s": std_runtime_us * 1.0e-6,
         }
 
+    _GRID_DIM_Y_LIMIT = 65535
+    _INT32_MAX = 2**31 - 1
+
+    def shape_problem(m: int, k: int, rows_per_cta: int, k_tile: int):
+        """Map a logical (m, k) problem to the physical (padded) problem the
+        kernel executes, validating every real constraint along the way.
+        """
+        if m < 1 or k < 1:
+            raise ValueError(f"m and k must be >= 1, got m={m}, k={k}")
+        if m > _INT32_MAX or k > _INT32_MAX:
+            raise ValueError(
+                f"m and k must fit Int32 (<= {_INT32_MAX}) because they are passed "
+                f"to the kernel as Int32 scalars, got m={m}, k={k}"
+            )
+        kernel_m = ceil_div(m, rows_per_cta) * rows_per_cta
+        kernel_k = ceil_div(k, k_tile) * k_tile
+        grid_m = kernel_m // rows_per_cta
+        grid_k = kernel_k // k_tile
+        if grid_m > _INT32_MAX:
+            raise ValueError(
+                f"gridDim.x limit exceeded: {grid_m} row-tiles > {_INT32_MAX}"
+            )
+        if grid_k > _GRID_DIM_Y_LIMIT:
+            raise ValueError(
+                f"gridDim.y limit exceeded: k={k} with k_tile={k_tile} needs "
+                f"grid_k={grid_k} > {_GRID_DIM_Y_LIMIT} K-tiles. Reduce k_tile or "
+                "reshape the problem."
+            )
+        return kernel_m, kernel_k, grid_m, grid_k
+
+    def check_cuda_launch_errors(cuda, stream, context: str = "kernel launch") -> None:
+        result = cuda.cuStreamSynchronize(stream)
+        status = result[0] if isinstance(result, tuple) else result
+        if status != cuda.CUresult.CUDA_SUCCESS:
+            err = cuda.cuGetErrorName(status)
+            name = err[1] if isinstance(err, tuple) else err
+            raise RuntimeError(f"CUDA error after {context}: {name}")
+
+    def _resolve_input_dtype(dtype_name: str):
+        dtype_name = dtype_name.lower()
+        if dtype_name == "bf16":
+            return torch.bfloat16, cutlass.BFloat16
+        if dtype_name == "fp16":
+            return torch.float16, cutlass.Float16
+        raise ValueError("input_dtype must be one of: bf16, fp16")
+
+    def prepare_and_quantize(m: int, k: int, dtype_name: str, seed: int, stream):
+        """Quantize one (m, k) matrix end to end: shape, pad, launch, verify.
+
+        Returns the materialized buffers (including the packed atom-layout scale
+        bytes), the compiled kernel, and the per-matrix verification stats. Used
+        by the end-to-end blockscaled GEMM path.
+        """
+        torch.manual_seed(seed)
+        torch_input_dtype, cutlass_input_dtype = _resolve_input_dtype(dtype_name)
+        kernel_m, kernel_k, _, _ = shape_problem(
+            m, k, DEFAULT_ROWS_PER_CTA, DEFAULT_K_TILE
+        )
+        x = torch.randn((m, k), dtype=torch_input_dtype, device="cuda")
+        buffers = materialize_quantizer_buffers(
+            kernel_m, kernel_k, torch_input_dtype, cutlass_input_dtype, x
+        )
+        cfg = MXFP8QuantizerConfig(input_dtype=cutlass_input_dtype)
+        compiled = make_compiled_quantizer(
+            cfg,
+            buffers["x_ptr"],
+            buffers["q_dwords_ptr"],
+            buffers["s_words_ptr"],
+            kernel_m,
+            kernel_k,
+            buffers["s_storage_word_count"],
+            stream,
+        )
+        compiled(
+            buffers["x_ptr"],
+            buffers["q_dwords_ptr"],
+            buffers["s_words_ptr"],
+            Int32(kernel_m),
+            Int32(kernel_k),
+            Int32(buffers["s_storage_word_count"]),
+            stream,
+        )
+        torch.cuda.synchronize()
+        check_cuda_launch_errors(cuda, stream, "quantizer launch")
+        verify = verify_quantizer_outputs(buffers, kernel_m, kernel_k, m, k)
+        if not verify["verification_passed"]:
+            raise ValueError(
+                f"quantizer verification failed for ({m}, {k}): {verify}"
+            )
+        return {
+            "m": m,
+            "k": k,
+            "kernel_m": kernel_m,
+            "kernel_k": kernel_k,
+            "x": x,
+            "buffers": buffers,
+            "compiled": compiled,
+            "verify": verify,
+        }
+
     def run_quantizer(
         m: int,
         k: int,
@@ -661,33 +870,19 @@ def _build_runtime():
         iterations: int,
         benchmark_repeats: int,
         cold_l2: bool,
+        skip_verification: bool,
         seed: int,
     ) -> dict[str, Any]:
         torch.manual_seed(seed)
-        if k % SCALE_VEC_SIZE != 0:
-            raise ValueError("K must be divisible by 32")
         dtype_name = input_dtype.lower()
-        if dtype_name == "bf16":
-            torch_input_dtype = torch.bfloat16
-            cutlass_input_dtype = cutlass.BFloat16
-        elif dtype_name == "fp16":
-            torch_input_dtype = torch.float16
-            cutlass_input_dtype = cutlass.Float16
-        else:
-            raise ValueError("input_dtype must be one of: bf16, fp16")
+        torch_input_dtype, cutlass_input_dtype = _resolve_input_dtype(input_dtype)
 
         x = torch.randn((m, k), dtype=torch_input_dtype, device="cuda")
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-        selected_rows_per_cta = rows_per_cta
-        selected_k_tile = k_tile
-        full_rows_supported = (m % selected_rows_per_cta) == 0
-        full_tile_fast_path = full_rows_supported and (k % selected_k_tile == 0)
-        kernel_m = (
-            m if full_tile_fast_path else ceil_div(m, selected_rows_per_cta) * selected_rows_per_cta
-        )
-        kernel_k = k if full_tile_fast_path else ceil_div(k, selected_k_tile) * selected_k_tile
+        is_full_tile = (m % rows_per_cta == 0) and (k % k_tile == 0)
+        kernel_m, kernel_k, grid_m, grid_k = shape_problem(m, k, rows_per_cta, k_tile)
         buffers = materialize_quantizer_buffers(
             kernel_m,
             kernel_k,
@@ -695,13 +890,13 @@ def _build_runtime():
             cutlass_input_dtype,
             x,
         )
-        best_cfg = MXFP8QuantizerConfig(
+        cfg = MXFP8QuantizerConfig(
             input_dtype=cutlass_input_dtype,
-            rows_per_cta=selected_rows_per_cta,
-            k_tile=selected_k_tile,
+            rows_per_cta=rows_per_cta,
+            k_tile=k_tile,
         )
         compiled_quantizer = make_compiled_quantizer(
-            best_cfg,
+            cfg,
             buffers["x_ptr"],
             buffers["q_dwords_ptr"],
             buffers["s_words_ptr"],
@@ -711,18 +906,59 @@ def _build_runtime():
             stream,
         )
 
-        kernel_args = testing.JitArguments(
-            buffers["x_ptr"],
-            buffers["q_dwords_ptr"],
-            buffers["s_words_ptr"],
-            Int32(kernel_m),
-            Int32(kernel_k),
-            Int32(buffers["s_storage_word_count"]),
-            stream,
-        )
+        verify_results = None
+        if not skip_verification:
+            # Launch once on the seeded input and compare against the independent
+            # torch reference before any timing is collected, so a wrong kernel
+            # can never silently produce benchmark numbers.
+            compiled_quantizer(
+                buffers["x_ptr"],
+                buffers["q_dwords_ptr"],
+                buffers["s_words_ptr"],
+                Int32(kernel_m),
+                Int32(kernel_k),
+                Int32(buffers["s_storage_word_count"]),
+                stream,
+            )
+            torch.cuda.synchronize()
+            check_cuda_launch_errors(cuda, stream, "quantizer verification launch")
+            verify_results = verify_quantizer_outputs(
+                buffers, kernel_m, kernel_k, m, k
+            )
+            if not verify_results["verification_passed"]:
+                raise ValueError(
+                    "MXFP8 quantizer correctness check FAILED: "
+                    f"scale bytes bit-exact={verify_results['scale_bytes_exact']}, "
+                    f"fp8 payload max byte diff={verify_results['q_max_byte_diff']} "
+                    f"(tolerance {Q_BYTE_DIFF_TOLERANCE}), "
+                    f"exact byte fraction={verify_results['q_exact_fraction']:.6f}"
+                )
+            print(
+                "Correctness check passed: "
+                f"scale bytes bit-exact={verify_results['scale_bytes_exact']}, "
+                f"fp8 payload max byte diff={verify_results['q_max_byte_diff']}, "
+                f"exact byte fraction={verify_results['q_exact_fraction']:.6f}"
+            )
 
         def workspace_generator():
-            return kernel_args
+            # Each call returns a fresh set of buffers, so the cold-L2 benchmark
+            # path genuinely cycles through distinct memory workspaces instead
+            # of re-using one buffer set.
+            workspace_x = torch.randn(
+                (kernel_m, kernel_k), dtype=torch_input_dtype, device="cuda"
+            )
+            workspace_buffers = materialize_quantizer_buffers(
+                kernel_m, kernel_k, torch_input_dtype, cutlass_input_dtype, workspace_x
+            )
+            return testing.JitArguments(
+                workspace_buffers["x_ptr"],
+                workspace_buffers["q_dwords_ptr"],
+                workspace_buffers["s_words_ptr"],
+                Int32(kernel_m),
+                Int32(kernel_k),
+                Int32(workspace_buffers["s_storage_word_count"]),
+                stream,
+            )
 
         logical_bytes_moved = (2 * m * k) + (1 * m * k) + (1 * m * (k // SCALE_VEC_SIZE))
         physical_bytes_moved = (
@@ -760,24 +996,31 @@ def _build_runtime():
 
         result = {
             "launch_success": True,
+            "verification_ran": verify_results is not None,
+            "verification_passed": (
+                verify_results["verification_passed"] if verify_results is not None else None
+            ),
+            "q_max_byte_diff": verify_results["q_max_byte_diff"] if verify_results is not None else None,
+            "q_exact_fraction": verify_results["q_exact_fraction"] if verify_results is not None else None,
+            "scale_bytes_exact": (
+                verify_results["scale_bytes_exact"] if verify_results is not None else None
+            ),
             "input_dtype": dtype_name,
-            "rows_per_cta": best_cfg.rows_per_cta,
-            "k_tile": best_cfg.k_tile,
-            "threads_per_cta": best_cfg.threads_per_cta,
-            "blocks_per_tile": best_cfg.blocks_per_tile,
+            "rows_per_cta": cfg.rows_per_cta,
+            "k_tile": cfg.k_tile,
+            "threads_per_cta": cfg.threads_per_cta,
+            "blocks_per_tile": cfg.blocks_per_tile,
             "kernel_m": kernel_m,
             "kernel_k": kernel_k,
-            "grid_m": ceil_div(kernel_m, best_cfg.rows_per_cta),
-            "grid_k": ceil_div(kernel_k, best_cfg.k_tile),
-            "total_ctas": ceil_div(kernel_m, best_cfg.rows_per_cta) * ceil_div(kernel_k, best_cfg.k_tile),
+            "grid_m": grid_m,
+            "grid_k": grid_k,
+            "total_ctas": grid_m * grid_k,
             "runtime_min_s": runtime_min_s,
             "runtime_mean_s": runtime_mean_s,
             "runtime_std_s": runtime_std_s,
             "runtime_min_us": timing["min_runtime_us"],
             "runtime_mean_us": timing["mean_runtime_us"],
             "runtime_std_us": timing["std_runtime_us"],
-            "avg_runtime_s": runtime_mean_s,
-            "avg_runtime_us": timing["mean_runtime_us"],
             "effective_gb_s": effective_gb_s,
             "effective_gb_s_mean": effective_gb_s_mean,
             "effective_tb_s": effective_tb_s,
@@ -786,83 +1029,338 @@ def _build_runtime():
             "benchmark_repeats": benchmark_repeats,
             "workspace_count": workspace_count,
             "cold_l2": cold_l2,
-            "fast_full_tile_path": full_tile_fast_path,
-            "dispatch_mode": "cute_full_tile" if full_tile_fast_path else "cute_padded_fallback",
+            "is_full_tile": is_full_tile,
+            "dispatch_mode": "cute_full_tile" if is_full_tile else "cute_padded_fallback",
         }
         return result
 
-    return {"run_quantizer": run_quantizer}
+    def run_e2e_verification(
+        m: int,
+        n: int,
+        k: int,
+        input_dtype: str,
+        seed: int = 0,
+        gemm_tolerance: float = 1.0e-2,
+        mma_tiler_mn: tuple[int, int] = (128, 128),
+        cluster_shape_mn: tuple[int, int] = (1, 1),
+    ) -> dict[str, Any]:
+        """Quantize A (m, k) and B (n, k) with the MXFP8 kernel and feed the
+        outputs directly into the vendored SM100 blockscaled GEMM consumer.
+        """
+        from blockscaled_gemm import (
+            Sm100BlockScaledPersistentDenseGemmKernel,
+            scaled_mm,
+        )
+
+        # Validate the GEMM consumer's tiler/cluster constraints up front so a
+        # misconfigured suite entry fails loudly before any compile or launch
+        # (mirrors is_valid_mma_tiler_and_cluster_shape in blockscaled_gemm.py).
+        if (
+            mma_tiler_mn[0] not in (128, 256)
+            or mma_tiler_mn[1] not in (64, 128, 192, 256)
+        ):
+            raise ValueError(
+                f"mma_tiler_mn must be M in (128, 256) and N in (64, 128, 192, 256), "
+                f"got {mma_tiler_mn}"
+            )
+        is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
+        if (
+            not is_power_of_2(cluster_shape_mn[0])
+            or not is_power_of_2(cluster_shape_mn[1])
+            or cluster_shape_mn[0] > 4
+            or cluster_shape_mn[1] > 4
+            or cluster_shape_mn[0] * cluster_shape_mn[1] > 16
+        ):
+            raise ValueError(
+                f"cluster_shape_mn entries must be powers of two in [1, 4] with a "
+                f"product <= 16 (SF multicast limit), got {cluster_shape_mn}"
+            )
+        if mma_tiler_mn[0] == 256 and cluster_shape_mn[0] % 2 != 0:
+            raise ValueError(
+                f"cluster_shape_mn[0] must be a multiple of 2 when "
+                f"mma_tiler_mn[0] == 256 (2-CTA MMA), got cluster_shape_mn="
+                f"{cluster_shape_mn}"
+            )
+        if m % mma_tiler_mn[0] != 0 or n % mma_tiler_mn[1] != 0:
+            raise ValueError(
+                f"GEMM consumer requires M % {mma_tiler_mn[0]} == 0 and "
+                f"N % {mma_tiler_mn[1]} == 0 for mma_tiler_mn={mma_tiler_mn}, "
+                f"got m={m}, n={n}"
+            )
+        if k % DEFAULT_K_TILE != 0:
+            raise ValueError(
+                f"GEMM consumer requires K % {DEFAULT_K_TILE} == 0 (mma K tiler + "
+                "quantizer k_tile, so the emitted scale layout is never padded), "
+                f"got k={k}"
+            )
+
+        torch.manual_seed(seed)
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+        a_res = prepare_and_quantize(m, k, input_dtype, seed, stream)
+        b_res = prepare_and_quantize(n, k, input_dtype, seed + 1, stream)
+
+        # Aligned problems => the quantizer emits unpadded buffers, so the
+        # fp8 payloads are exactly (m, k) / (n, k) and the packed scale bytes
+        # are exactly the tcgen05 atom layout for the GEMM's (m, k) / (n, k).
+        a_q = a_res["buffers"]["q_fp8"]
+        b_q = b_res["buffers"]["q_fp8"]
+        a_s_bytes = a_res["buffers"]["s_storage_bytes"]
+        b_s_bytes = b_res["buffers"]["s_storage_bytes"]
+        c = torch.zeros((m, n), dtype=torch.float32, device="cuda")
+
+        gemm_obj = Sm100BlockScaledPersistentDenseGemmKernel(
+            32,  # sf_vec_size, matching the quantizer's SCALE_VEC_SIZE
+            mma_tiler_mn,
+            cluster_shape_mn,
+        )
+        if not gemm_obj.can_implement(
+            (m, n, k, 1),
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E8M0FNU,
+            cutlass.Float32,
+            "k",  # a_major: A is row-major (M, K) => K is the contiguous dim
+            "k",  # b_major: B is row-major (N, K) => K is the contiguous dim
+            "n",  # c_major: C is row-major (M, N)
+            32,
+            mma_tiler_mn,
+            cluster_shape_mn,
+        ):
+            raise ValueError("GEMM cannot implement this problem configuration")
+
+        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
+            cluster_shape_mn[0] * cluster_shape_mn[1]
+        )
+        compiled_gemm = scaled_mm(
+            gemm_obj,
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E4M3FN,
+            cutlass.Float32,
+            cutlass.Float8E8M0FNU,
+            "k",
+            "k",  
+            "n",  
+            max_active_clusters,
+            stream,
+        )
+
+        a_ptr = make_ptr(
+            cutlass.Float8E4M3FN, a_q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        )
+        b_ptr = make_ptr(
+            cutlass.Float8E4M3FN, b_q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        )
+        sfa_ptr = make_ptr(
+            cutlass.Float8E8M0FNU,
+            a_s_bytes.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=32,
+        )
+        sfb_ptr = make_ptr(
+            cutlass.Float8E8M0FNU,
+            b_s_bytes.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=32,
+        )
+        c_ptr = make_ptr(
+            cutlass.Float32, c.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        )
+
+        # The scale-factor pointers point directly at the quantizer's packed
+        # buffers: the GEMM reads them in the tcgen05 atom layout with no
+        # intermediate repacking stage. If this layout ever diverged from
+        # BlockScaledBasicChunk, C would be garbage and the check below fails.
+        compiled_gemm(
+            a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (m, n, k, 1), stream
+        )
+        torch.cuda.synchronize()
+        check_cuda_launch_errors(cuda, stream, "blockscaled GEMM launch")
+        sfa_scale = torch.exp2(
+            decode_scale_bytes(a_s_bytes, m, k).to(torch.float32) - 127.0
+        ).repeat_interleave(SCALE_VEC_SIZE, dim=1)[:, :k]
+        sfb_scale = torch.exp2(
+            decode_scale_bytes(b_s_bytes, n, k).to(torch.float32) - 127.0
+        ).repeat_interleave(SCALE_VEC_SIZE, dim=1)[:, :k]
+        ref = (a_q.to(torch.float32) * sfa_scale) @ (
+            b_q.to(torch.float32) * sfb_scale
+        ).T
+
+        abs_err = (c - ref).abs()
+        max_abs_err = float(abs_err.max().item())
+        allowed_err = gemm_tolerance + gemm_tolerance * ref.abs()
+        max_err_ratio = float((abs_err / allowed_err).max().item())
+        pass_margin = 1.0 / max_err_ratio
+        torch.testing.assert_close(c, ref, rtol=gemm_tolerance, atol=gemm_tolerance)
+
+        print(
+            "End-to-end blockscaled GEMM check passed: "
+            f"max_abs_err={max_abs_err:.3e}, "
+            f"max_err_ratio={max_err_ratio:.3f} "
+            f"(atol=rtol={gemm_tolerance:.0e}, pass margin={pass_margin:.1f}x)"
+        )
+        return {
+            "e2e_verification_passed": True,
+            "m": m,
+            "n": n,
+            "k": k,
+            "input_dtype": input_dtype,
+            "gemm_config": {
+                "mma_tiler_mn": list(mma_tiler_mn),
+                "cluster_shape_mn": list(cluster_shape_mn),
+                "sf_vec_size": SCALE_VEC_SIZE,
+                "sf_dtype": "Float8E8M0FNU",
+                "a/b_dtype": "Float8E4M3FN",
+                "c_dtype": "Float32",
+            },
+            "sfa_layout": "tcgen05_atom_layout_packed_direct",
+            "quantizer_verify_a": a_res["verify"],
+            "quantizer_verify_b": b_res["verify"],
+            "max_abs_err": max_abs_err,
+            "max_err_ratio": max_err_ratio,
+            "pass_margin": pass_margin,
+            "gemm_tolerance": gemm_tolerance,
+        }
+
+    def run_e2e_suite(
+        configs: tuple[
+            tuple[int, int, int, str, int, tuple[int, int], tuple[int, int]], ...
+        ] = DEFAULT_E2E_SUITE,
+        gemm_tolerance: float = 1.0e-2,
+    ) -> dict[str, Any]:
+        """Run the e2e quantizer -> blockscaled GEMM verification across a
+        suite of (m, n, k, dtype, seed, mma_tiler, cluster) configs.
+
+        Every config must pass its quantizer verification and the GEMM check;
+        any failure raises with the failing config's details. Configs that
+        share an (mma_tiler_mn, cluster_shape_mn) pair can reuse the compiled
+        GEMM, so the default suite groups them; each distinct pair costs one
+        GEMM compile (the dominant cost), which is why the default suite is
+        kept small.
+        """
+        results = []
+        for cfg in configs:
+            m, n, k, input_dtype, seed, mma_tiler_mn, cluster_shape_mn = cfg
+            result = run_e2e_verification(
+                m=m,
+                n=n,
+                k=k,
+                input_dtype=input_dtype,
+                seed=seed,
+                gemm_tolerance=gemm_tolerance,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+            )
+            results.append(result)
+
+        config_summary = []
+        for cfg, r in zip(configs, results):
+            m, n, k, input_dtype, seed, mma_tiler_mn, cluster_shape_mn = cfg
+            config_summary.append(
+                {
+                    "m": m,
+                    "n": n,
+                    "k": k,
+                    "input_dtype": input_dtype,
+                    "seed": seed,
+                    "mma_tiler_mn": list(mma_tiler_mn),
+                    "cluster_shape_mn": list(cluster_shape_mn),
+                    "quantizer_verify_passed": (
+                        r["quantizer_verify_a"]["verification_passed"]
+                        and r["quantizer_verify_b"]["verification_passed"]
+                    ),
+                    "max_abs_err": r["max_abs_err"],
+                    "max_err_ratio": r["max_err_ratio"],
+                    "pass_margin": r["pass_margin"],
+                }
+            )
+        worst_abs = max(r["max_abs_err"] for r in results)
+        worst_ratio = max(r["max_err_ratio"] for r in results)
+        print(
+            f"e2e suite passed: {len(results)}/{len(results)} configs "
+            f"(worst max_abs_err={worst_abs:.3e}, "
+            f"worst max_err_ratio={worst_ratio:.3f})"
+        )
+        return {
+            "e2e_suite_passed": True,
+            "num_configs": len(results),
+            "gemm_tolerance": gemm_tolerance,
+            "configs": config_summary,
+        }
+
+    return {
+        "run_quantizer": run_quantizer,
+        "run_e2e_verification": run_e2e_verification,
+        "run_e2e_suite": run_e2e_suite,
+        "prepare_and_quantize": prepare_and_quantize,
+    }
 
 
-@app.function(gpu="B200", timeout=60 * 60)
-def run_on_b200(
+# build_runtime() is a factory, not an entrypoint: it exists so the heavy
+# CUDA/CuTeDSL/torch imports stay inside one deferred scope (this module stays
+# importable anywhere without the GPU stack) and so a fresh compile cache is
+# created per process invocation.
+
+def run_quantizer(
     m: int = 16384,
     k: int = 16384,
+    rows_per_cta: int = DEFAULT_ROWS_PER_CTA,
+    k_tile: int = DEFAULT_K_TILE,
     input_dtype: str = "bf16",
     warmup_iterations: int = 10,
     iterations: int = 50,
     benchmark_repeats: int = 5,
     cold_l2: bool = False,
+    skip_verification: bool = False,
     seed: int = 0,
 ) -> dict[str, Any]:
-    runtime = _build_runtime()
-    return runtime["run_quantizer"](
+    return build_runtime()["run_quantizer"](
         m=m,
         k=k,
-        rows_per_cta=ROWS_PER_CTA,
-        k_tile=K_TILE,
+        rows_per_cta=rows_per_cta,
+        k_tile=k_tile,
         input_dtype=input_dtype,
         warmup_iterations=warmup_iterations,
         iterations=iterations,
         benchmark_repeats=benchmark_repeats,
         cold_l2=cold_l2,
+        skip_verification=skip_verification,
         seed=seed,
     )
 
-
-@app.local_entrypoint()
-def main(
-    m: int = 16384,
-    k: int = 16384,
+def run_e2e_verification(
+    m: int = 1024,
+    n: int = 1024,
+    k: int = 2048,
     input_dtype: str = "bf16",
-    warmup_iterations: int = 10,
-    iterations: int = 50,
-    benchmark_repeats: int = 5,
-    cold_l2: bool = False,
     seed: int = 0,
-):
-    result = run_on_b200.remote(
+    gemm_tolerance: float = 1.0e-2,
+    mma_tiler_mn: tuple[int, int] = (128, 128),
+    cluster_shape_mn: tuple[int, int] = (1, 1),
+) -> dict[str, Any]:
+    return build_runtime()["run_e2e_verification"](
         m=m,
+        n=n,
         k=k,
         input_dtype=input_dtype,
-        warmup_iterations=warmup_iterations,
-        iterations=iterations,
-        benchmark_repeats=benchmark_repeats,
-        cold_l2=cold_l2,
         seed=seed,
+        gemm_tolerance=gemm_tolerance,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
     )
-    summary = {
-        "launch_success": result["launch_success"],
-        "dispatch_mode": result["dispatch_mode"],
-        "runtime_min_s": result["runtime_min_s"],
-        "runtime_min_us": result["runtime_min_us"],
-        "avg_runtime_s": result["avg_runtime_s"],
-        "avg_runtime_us": result["avg_runtime_us"],
-        "runtime_std_us": result["runtime_std_us"],
-        "effective_gb_s": result["effective_gb_s"],
-        "effective_gb_s_mean": result["effective_gb_s_mean"],
-        "effective_tb_s": result["effective_tb_s"],
-        "logical_bytes_moved": result["logical_bytes_moved"],
-        "physical_bytes_moved": result["physical_bytes_moved"],
-        "input_dtype": result["input_dtype"],
-        "rows_per_cta": result["rows_per_cta"],
-        "k_tile": result["k_tile"],
-        "grid_m": result["grid_m"],
-        "grid_k": result["grid_k"],
-        "total_ctas": result["total_ctas"],
-        "benchmark_repeats": result["benchmark_repeats"],
-        "workspace_count": result["workspace_count"],
-        "cold_l2": result["cold_l2"],
-        "fast_full_tile_path": result["fast_full_tile_path"],
-    }
-    print(json.dumps(summary, indent=2, sort_keys=True))
+
+def run_e2e_suite(
+    configs: tuple[
+        tuple[int, int, int, str, int, tuple[int, int], tuple[int, int]], ...
+    ] = DEFAULT_E2E_SUITE,
+    gemm_tolerance: float = 1.0e-2,
+) -> dict[str, Any]:
+    return build_runtime()["run_e2e_suite"](
+        configs=configs, gemm_tolerance=gemm_tolerance
+    )
+
+def prepare_and_quantize(m: int, k: int, dtype_name: str, seed: int, stream) -> dict[str, Any]:
+    """Lower-level helper: quantize one (m, k) matrix end to end (shape, pad,
+    launch, verify) and return the buffers, compiled kernel, and verification
+    stats. Used by :func:`run_e2e_verification`; exposed for tests."""
+    return build_runtime()["prepare_and_quantize"](m, k, dtype_name, seed, stream)
